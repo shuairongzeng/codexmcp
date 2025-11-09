@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import subprocess
 import threading
@@ -32,8 +33,11 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     Yields:
         Output lines from the command
     """
+    # On Windows, wrap command with cmd.exe to execute .cmd batch files
+    popen_cmd = ["cmd", "/c", *cmd] if os.name == "nt" else cmd
+
     process = subprocess.Popen(
-        cmd,
+        popen_cmd,
         shell=False,  # Safer: no shell injection
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
