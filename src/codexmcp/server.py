@@ -37,10 +37,13 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     # On Windows, codex is exposed via a *.cmd shim. Use cmd.exe with /s so
     # user prompts containing quotes/newlines aren't reinterpreted as shell syntax.
     popen_cmd = cmd
-    
-    codex_path = shutil.which('codex') or None  # 替换运行路径  
-    if codex_path is not None:
-        popen_cmd[0] = codex_path  
+     
+    codex_path = shutil.which('codex') or cmd[0]
+    popen_cmd[0] = codex_path
+
+    if os.name == "nt" and codex_path.lower().endswith((".cmd", ".bat")):
+        from subprocess import list2cmdline
+        popen_cmd = ["cmd.exe", "/s", "/c", list2cmdline(cmd)]
 
     process = subprocess.Popen(
         popen_cmd,
