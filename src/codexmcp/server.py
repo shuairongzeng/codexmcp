@@ -13,6 +13,7 @@ from typing import Annotated, Any, Dict, Generator, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BeforeValidator, Field
+import shutil
 
 mcp = FastMCP("Codex MCP Server-from guda.studio")
 
@@ -35,11 +36,11 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     """
     # On Windows, codex is exposed via a *.cmd shim. Use cmd.exe with /s so
     # user prompts containing quotes/newlines aren't reinterpreted as shell syntax.
-    if os.name == "nt":
-        quoted_cmd = subprocess.list2cmdline(cmd)
-        popen_cmd = ["cmd", "/d", "/s", "/c", quoted_cmd]
-    else:
-        popen_cmd = cmd
+    popen_cmd = cmd
+    
+    codex_path = shutil.which('codex') or None  # 替换运行路径  
+    if codex_path is not None:
+        popen_cmd[0] = codex_path  
 
     process = subprocess.Popen(
         popen_cmd,
@@ -48,7 +49,7 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
-        bufsize=1,
+        encoding='utf-8',
     )
 
     output_queue: queue.Queue[str] = queue.Queue()
