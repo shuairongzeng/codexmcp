@@ -48,7 +48,7 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     process = subprocess.Popen(
         popen_cmd,
         shell=False,  # Safer: no shell injection
-        stdin=subprocess.DEVNULL,  # Prevent process from waiting for input
+        stdin=subprocess.PIPE,  # Prevent process from waiting for input
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
