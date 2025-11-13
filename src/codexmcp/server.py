@@ -158,8 +158,12 @@ async def codex(
 
     if SESSION_ID is not None:
         cmd.extend(["resume", str(SESSION_ID)])
-    PROMPT = PROMPT
-    cmd += ['--', windows_escape(PROMPT)]
+        
+    if os.name == "nt":
+        PROMPT = windows_escape(PROMPT)
+    else:
+        PROMPT = PROMPT
+    cmd += ['--', PROMPT]
 
     all_messages: list[Dict[str, Any]] = []
     agent_messages = ""
