@@ -7,9 +7,10 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
+from typing import Annotated, Any, Dict, Generator, List, Literal, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BeforeValidator, Field
@@ -25,25 +26,30 @@ def _empty_str_to_none(value: str | None) -> str | None:
     return value
 
 
-def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
-    """Execute a command and stream its output line-by-line.
+def run_shell_command(
+    cmd: list[str],
+    timeout: Optional[float] = None,
+) -> Tuple[subprocess.Popen[str], Generator[str, None, None], List[bool]]:
+    """Execute a command and stream its output line-by-line with optional timeout.
 
     Args:
         cmd: Command and arguments as a list (e.g., ["codex", "exec", "prompt"])
+        timeout: Optional timeout in seconds. None means no timeout.
+
+    Returns:
+        Tuple of (process, output_generator, timeout_flag)
+        - process: The subprocess.Popen instance
+        - output_generator: Generator yielding output lines
+        - timeout_flag: Mutable list [bool] indicating if timeout occurred.
+                       Check timeout_flag[0] after consuming the generator.
 
     Yields:
         Output lines from the command
     """
-    # On Windows, codex is exposed via a *.cmd shim. Use cmd.exe with /s so
-    # user prompts containing quotes/newlines aren't reinterpreted as shell syntax.
-    popen_cmd = cmd
-     
+    # Copy the command list to avoid modifying the caller's list
+    popen_cmd = list(cmd)
     codex_path = shutil.which('codex') or cmd[0]
     popen_cmd[0] = codex_path
-
-    # if os.name == "nt" and codex_path.lower().endswith((".cmd", ".bat")):
-    #     from subprocess import list2cmdline
-    #     popen_cmd = ["cmd.exe", "/s", "/c", list2cmdline(cmd)]
 
     process = subprocess.Popen(
         popen_cmd,
@@ -56,6 +62,8 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     )
 
     output_queue: queue.Queue[str] = queue.Queue()
+    # Use list to allow mutation in nested function (mutable container pattern)
+    timeout_flag = [False]
 
     def read_output() -> None:
         """Read process output in a separate thread."""
@@ -68,43 +76,45 @@ def run_shell_command(cmd: list[str]) -> Generator[str, None, None]:
     thread.daemon = True
     thread.start()
 
-    # Yield lines while process is running
-    while process.poll() is None:
-        try:
-            yield output_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue
+    start_time = time.monotonic()
 
-    process.wait()
+    def line_iterator() -> Generator[str, None, None]:
+        """Generator that yields output lines with timeout protection."""
+        nonlocal start_time
 
-    # Drain remaining output from queue
-    while not output_queue.empty():
-        try:
-            yield output_queue.get_nowait()
-        except queue.Empty:
-            break
-def windows_escape(prompt):
-    """
-    Windows 风格的字符串转义函数。
-    把常见特殊字符转义成 \\ 形式，适合命令行、JSON 或路径使用。
-    比如：\n 变成 \\n，" 变成 \\"。
-    """
-    # 先处理反斜杠，避免它干扰其他替换
-    result = prompt.replace('\\', '\\\\')
-    # 双引号，转义成 \"，防止字符串边界乱套
-    result = result.replace('"', '\\"')
-    # 换行符，Windows 常用 \r\n，但我们分开转义
-    result = result.replace('\n', '\\n')
-    result = result.replace('\r', '\\r')
-    # 制表符，空格的“超级版”
-    result = result.replace('\t', '\\t')
-    # 其他常见：退格符（像按了后退键）、换页符（打印机跳页用）
-    result = result.replace('\b', '\\b')
-    result = result.replace('\f', '\\f')
-    # 如果有单引号，也转义下（不过 Windows 命令行不那么严格，但保险起见）
-    result = result.replace("'", "\\'")
-    
-    return result
+        # Yield lines while process is running
+        while process.poll() is None:
+            # Check timeout
+            if timeout is not None and (time.monotonic() - start_time) > timeout:
+                timeout_flag[0] = True
+                # Graceful termination: SIGTERM first
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # Force kill if still alive after 2 seconds
+                    process.kill()
+                    process.wait()
+                break
+
+            try:
+                yield output_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+        # Process has exited, wait for read thread to finish to avoid losing tail output
+        thread.join(timeout=1)
+
+        # Drain remaining output from queue
+        while not output_queue.empty():
+            try:
+                yield output_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    # Return the mutable list so caller can check timeout_flag[0] after consuming iterator
+    return process, line_iterator(), timeout_flag
+
 
 @mcp.tool(
     name="codex",
@@ -170,33 +180,40 @@ async def codex(
         Optional[str],
         "Configuration profile name to load from `~/.codex/config.toml`. Default user configuration is applied; this parameter remains inactive unless explicitly specified by the user.",
     ] = None,
+    timeout: Annotated[
+        Optional[float],
+        Field(
+            description="Command execution timeout in seconds. Pass None to disable timeout. Defaults to 600 seconds (10 minutes)."
+        ),
+    ] = 600.0,
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
     # Build command as list to avoid injection
     cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
-    
+
+    # Fix: Handle image paths correctly by adding each as separate --image argument
+    # This avoids TypeError with Path objects and handles paths with commas/spaces
     if image is not None:
-        cmd.extend(["--image", ",".join(image)])
-        
+        for img_path in image:
+            cmd.extend(["--image", str(img_path)])
+
     if model is not None:
         cmd.extend(["--model", model])
-        
+
     if profile is not None:
         cmd.extend(["--profile", profile])
-        
+
     if yolo:
         cmd.append("--yolo")
-    
+
     if skip_git_repo_check:
         cmd.append("--skip-git-repo-check")
 
     if SESSION_ID is not None:
         cmd.extend(["resume", str(SESSION_ID)])
-        
-    if os.name == "nt":
-        PROMPT = windows_escape(PROMPT)
-    else:
-        PROMPT = PROMPT
+
+    # No escaping needed: shell=False means arguments are passed directly
+    # Removed harmful windows_escape() that was corrupting prompts
     cmd += ['--', PROMPT]
 
     all_messages: list[Dict[str, Any]] = []
@@ -204,8 +221,14 @@ async def codex(
     success = True
     err_message = ""
     thread_id: Optional[str] = None
+    last_output_line: Optional[str] = None
 
-    for line in run_shell_command(cmd):
+    # Execute command with timeout protection
+    process, output_iter, timeout_flag = run_shell_command(cmd, timeout=timeout)
+
+    # Process output lines
+    for line in output_iter:
+        last_output_line = line  # Track last line for error reporting
         try:
             line_dict = json.loads(line.strip())
             all_messages.append(line_dict)
@@ -216,8 +239,8 @@ async def codex(
             if line_dict.get("thread_id") is not None:
                 thread_id = line_dict.get("thread_id")
         except json.JSONDecodeError as error:
-            # Improved error handling: include problematic line
-            err_message = line
+            # Include problematic line in error message
+            err_message = f"JSON decode error: {line}"
             success = False
             break
         except Exception as error:
@@ -225,25 +248,58 @@ async def codex(
             success = False
             break
 
-    if thread_id is None:
+    # Check timeout flag AFTER consuming the iterator (fix: was checking before iteration)
+    timed_out = timeout_flag[0]
+    if timed_out:
         success = False
-        err_message = "Failed to get `SESSION_ID` from the codex session. \n\n" + err_message
-        
-    if success and len(agent_messages) == 0:
-        success = False
-        err_message = "Failed to get `agent_messages` from the codex session. \n\nYou can try to set `return_all_messages` to `True` to get the full reasoning information. \n\n"
+        # Priority: timeout message takes precedence over other errors
+        err_message = f"Codex CLI execution timed out after {timeout} seconds"
 
+    # Critical: Check subprocess exit code (P0 fix)
+    returncode = process.poll()
+    if returncode is None:
+        returncode = process.wait()
+
+    # Non-zero exit code indicates failure
+    if success and returncode != 0:
+        success = False
+        err_message = f"Codex CLI exited with non-zero code: {returncode}"
+
+    # Validate required fields only if process succeeded
+    if success:
+        if thread_id is None:
+            success = False
+            err_message = "Failed to get `SESSION_ID` from the codex session."
+
+        if len(agent_messages) == 0:
+            success = False
+            err_message = "Failed to get `agent_messages` from the codex session. Try setting `return_all_messages` to `True` for detailed information."
+
+    # Build unified response structure (success and failure have same shape for easier consumption)
     if success:
         result: Dict[str, Any] = {
             "success": True,
             "SESSION_ID": thread_id,
             "agent_messages": agent_messages,
-            # "PROMPT": PROMPT,
         }
         if return_all_messages:
             result["all_messages"] = all_messages
     else:
-        result = {"success": False, "error": err_message}
+        # Enhanced error response with diagnostic information (P1 improvement)
+        result = {
+            "success": False,
+            "error": err_message,
+            "returncode": returncode,
+            "timeout": timed_out,
+            # Always include all_messages for debugging (even if empty list)
+            "all_messages": all_messages,
+        }
+        # Include partial SESSION_ID if available (helps with debugging)
+        if thread_id:
+            result["SESSION_ID"] = thread_id
+        # Include last output line for troubleshooting
+        if last_output_line:
+            result["last_output_line"] = last_output_line
 
     return result
 
